@@ -1,0 +1,609 @@
+// Image Processing Tool in C++
+// A console-based tool to load, display, filter, adjust, crop, resize
+// and save images. It works with BMP images and needs NO external
+// libraries, so it compiles anywhere with a standard C++ compiler.
+
+#include <iostream>
+#include <fstream>
+#include <iterator>
+#include <vector>
+#include <string>
+#include <cstdint>
+#include <cmath>
+#include <algorithm>
+#include <limits>
+#include <cstdlib>
+
+using namespace std;
+
+const int MAX_DIMENSION = 6000;   // largest supported width/height
+const size_t MAX_HISTORY = 5;     // number of undo steps
+
+// ---------------------------------------------------------------
+// Image data structure: RGB pixels stored row by row (3 bytes each)
+// ---------------------------------------------------------------
+struct Image {
+    int width = 0;
+    int height = 0;
+    vector<unsigned char> pixels;
+
+    bool empty() const { return pixels.empty(); }
+
+    unsigned char &at(int x, int y, int channel) {
+        return pixels[(static_cast<size_t>(y) * width + x) * 3 + channel];
+    }
+    unsigned char at(int x, int y, int channel) const {
+        return pixels[(static_cast<size_t>(y) * width + x) * 3 + channel];
+    }
+    void create(int w, int h) {
+        width = w;
+        height = h;
+        pixels.assign(static_cast<size_t>(w) * h * 3, 0);
+    }
+};
+
+// Keeps a value inside the valid colour range 0-255
+unsigned char clampByte(double value) {
+    if (value < 0) return 0;
+    if (value > 255) return 255;
+    return static_cast<unsigned char>(value + 0.5);
+}
+
+// ---------------------------------------------------------------
+// Input helpers (safe reading from the keyboard)
+// ---------------------------------------------------------------
+void exitOnEOF() {
+    if (cin.eof()) {
+        cout << "\nNo more input. Exiting.\n";
+        exit(0);
+    }
+}
+
+// Reads an integer between lo and hi (keeps asking until valid)
+int readIntInRange(const string &prompt, int lo, int hi) {
+    int value;
+    while (true) {
+        cout << prompt;
+        if (cin >> value) {
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            if (value >= lo && value <= hi) {
+                return value;
+            }
+            cout << "Please enter a number between " << lo << " and " << hi << ".\n";
+        } else {
+            exitOnEOF();
+            cout << "Invalid input! Please enter a number.\n";
+            cin.clear();
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+        }
+    }
+}
+
+// Reads a whole line of text (used for file names)
+string readLine(const string &prompt) {
+    string text;
+    while (true) {
+        cout << prompt;
+        getline(cin, text);
+        exitOnEOF();
+        if (!text.empty()) {
+            return text;
+        }
+        cout << "Input cannot be empty.\n";
+    }
+}
+
+bool askYesNo(const string &prompt) {
+    while (true) {
+        string answer = readLine(prompt + " (y/n): ");
+        if (answer == "y" || answer == "Y") return true;
+        if (answer == "n" || answer == "N") return false;
+        cout << "Please type y or n.\n";
+    }
+}
+
+// ---------------------------------------------------------------
+// BMP file reading and writing
+// ---------------------------------------------------------------
+uint32_t readU32(const vector<unsigned char> &b, size_t pos) {
+    return static_cast<uint32_t>(b[pos]) | (static_cast<uint32_t>(b[pos + 1]) << 8) |
+           (static_cast<uint32_t>(b[pos + 2]) << 16) | (static_cast<uint32_t>(b[pos + 3]) << 24);
+}
+
+uint16_t readU16(const vector<unsigned char> &b, size_t pos) {
+    return static_cast<uint16_t>(b[pos] | (b[pos + 1] << 8));
+}
+
+void writeU32(vector<unsigned char> &b, size_t pos, uint32_t v) {
+    for (int i = 0; i < 4; i++) b[pos + i] = static_cast<unsigned char>((v >> (8 * i)) & 0xFF);
+}
+
+void writeU16(vector<unsigned char> &b, size_t pos, uint16_t v) {
+    b[pos] = static_cast<unsigned char>(v & 0xFF);
+    b[pos + 1] = static_cast<unsigned char>((v >> 8) & 0xFF);
+}
+
+// Load Image: supports uncompressed 24-bit and 32-bit BMP files
+bool loadBMP(const string &filename, Image &img, string &error) {
+    ifstream file(filename.c_str(), ios::binary);
+    if (!file) {
+        error = "Could not open the file. Check the name and path.";
+        return false;
+    }
+    vector<unsigned char> buf((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
+
+    if (buf.size() < 54 || buf[0] != 'B' || buf[1] != 'M') {
+        error = "This is not a valid BMP file.";
+        return false;
+    }
+
+    uint32_t dataOffset = readU32(buf, 10);
+    int32_t width = static_cast<int32_t>(readU32(buf, 18));
+    int32_t rawHeight = static_cast<int32_t>(readU32(buf, 22));
+    uint16_t bitsPerPixel = readU16(buf, 28);
+    uint32_t compression = readU32(buf, 30);
+
+    if ((bitsPerPixel != 24 && bitsPerPixel != 32) || (compression != 0 && compression != 3)) {
+        error = "Only uncompressed 24-bit or 32-bit BMP images are supported.";
+        return false;
+    }
+
+    bool topDown = rawHeight < 0;
+    int height = (rawHeight < 0) ? -rawHeight : rawHeight;
+
+    if (width <= 0 || height <= 0 || width > MAX_DIMENSION || height > MAX_DIMENSION) {
+        error = "Image size is invalid or too large (max " + to_string(MAX_DIMENSION) + " pixels).";
+        return false;
+    }
+
+    size_t bytesPerPixel = bitsPerPixel / 8;
+    size_t rowSize = (static_cast<size_t>(width) * bytesPerPixel + 3) / 4 * 4;  // rows are padded to 4 bytes
+
+    if (dataOffset + rowSize * height > buf.size()) {
+        error = "The file is incomplete or corrupted.";
+        return false;
+    }
+
+    img.create(width, height);
+    for (int y = 0; y < height; y++) {
+        int srcRow = topDown ? y : (height - 1 - y);   // BMP rows are usually stored bottom-up
+        for (int x = 0; x < width; x++) {
+            size_t pos = dataOffset + static_cast<size_t>(srcRow) * rowSize + x * bytesPerPixel;
+            img.at(x, y, 0) = buf[pos + 2];   // red
+            img.at(x, y, 1) = buf[pos + 1];   // green
+            img.at(x, y, 2) = buf[pos];       // blue
+        }
+    }
+    return true;
+}
+
+// Image Saving: writes a 24-bit BMP file
+bool saveBMP(const string &filename, const Image &img) {
+    size_t rowSize = (static_cast<size_t>(img.width) * 3 + 3) / 4 * 4;
+    size_t fileSize = 54 + rowSize * img.height;
+    vector<unsigned char> buf(fileSize, 0);
+
+    buf[0] = 'B';
+    buf[1] = 'M';
+    writeU32(buf, 2, static_cast<uint32_t>(fileSize));
+    writeU32(buf, 10, 54);                                    // pixel data offset
+    writeU32(buf, 14, 40);                                    // header size
+    writeU32(buf, 18, static_cast<uint32_t>(img.width));
+    writeU32(buf, 22, static_cast<uint32_t>(img.height));
+    writeU16(buf, 26, 1);                                     // colour planes
+    writeU16(buf, 28, 24);                                    // bits per pixel
+    writeU32(buf, 34, static_cast<uint32_t>(rowSize * img.height));
+
+    for (int y = 0; y < img.height; y++) {
+        size_t rowStart = 54 + static_cast<size_t>(img.height - 1 - y) * rowSize;
+        for (int x = 0; x < img.width; x++) {
+            buf[rowStart + x * 3] = img.at(x, y, 2);
+            buf[rowStart + x * 3 + 1] = img.at(x, y, 1);
+            buf[rowStart + x * 3 + 2] = img.at(x, y, 0);
+        }
+    }
+
+    ofstream file(filename.c_str(), ios::binary);
+    if (!file) return false;
+    file.write(reinterpret_cast<const char *>(buf.data()), static_cast<streamsize>(buf.size()));
+    return static_cast<bool>(file);
+}
+
+// ---------------------------------------------------------------
+// Display Image: shows the image as ASCII art in the console
+// ---------------------------------------------------------------
+void displayImage(const Image &img) {
+    const string ramp = " .:-=+*#%@";            // light to dark characters
+    int outWidth = min(img.width, 70);
+    // Console characters are about twice as tall as wide, so halve the height
+    int outHeight = max(1, static_cast<int>(img.height * (static_cast<double>(outWidth) / img.width) * 0.5 + 0.5));
+
+    cout << "\n+" << string(outWidth, '-') << "+\n";
+    for (int oy = 0; oy < outHeight; oy++) {
+        cout << "|";
+        int y0 = oy * img.height / outHeight;
+        int y1 = max(y0 + 1, (oy + 1) * img.height / outHeight);
+        for (int ox = 0; ox < outWidth; ox++) {
+            int x0 = ox * img.width / outWidth;
+            int x1 = max(x0 + 1, (ox + 1) * img.width / outWidth);
+
+            // Average brightness of this block of pixels
+            double sum = 0;
+            int count = 0;
+            for (int y = y0; y < y1; y++) {
+                for (int x = x0; x < x1; x++) {
+                    sum += 0.299 * img.at(x, y, 0) + 0.587 * img.at(x, y, 1) + 0.114 * img.at(x, y, 2);
+                    count++;
+                }
+            }
+            double brightness = sum / count;
+            int index = static_cast<int>(brightness / 256.0 * ramp.size());
+            cout << ramp[index];
+        }
+        cout << "|\n";
+    }
+    cout << "+" << string(outWidth, '-') << "+\n";
+    cout << "Image size: " << img.width << " x " << img.height << " pixels\n";
+}
+
+// ---------------------------------------------------------------
+// Image Filters
+// ---------------------------------------------------------------
+void applyGrayscale(Image &img) {
+    for (int y = 0; y < img.height; y++) {
+        for (int x = 0; x < img.width; x++) {
+            unsigned char gray = clampByte(0.299 * img.at(x, y, 0) + 0.587 * img.at(x, y, 1) + 0.114 * img.at(x, y, 2));
+            img.at(x, y, 0) = img.at(x, y, 1) = img.at(x, y, 2) = gray;
+        }
+    }
+}
+
+// Applies a 3x3 kernel to every pixel (edge pixels reuse their nearest neighbours)
+void applyKernel(Image &img, const double kernel[9], double divisor) {
+    Image result = img;
+    for (int y = 0; y < img.height; y++) {
+        for (int x = 0; x < img.width; x++) {
+            for (int c = 0; c < 3; c++) {
+                double sum = 0;
+                for (int ky = -1; ky <= 1; ky++) {
+                    for (int kx = -1; kx <= 1; kx++) {
+                        int px = min(max(x + kx, 0), img.width - 1);
+                        int py = min(max(y + ky, 0), img.height - 1);
+                        sum += img.at(px, py, c) * kernel[(ky + 1) * 3 + (kx + 1)];
+                    }
+                }
+                result.at(x, y, c) = clampByte(sum / divisor);
+            }
+        }
+    }
+    img = result;
+}
+
+void applyBlur(Image &img, int strength) {
+    const double kernel[9] = {1, 2, 1,
+                              2, 4, 2,
+                              1, 2, 1};
+    for (int i = 0; i < strength; i++) {
+        applyKernel(img, kernel, 16.0);
+    }
+}
+
+void applySharpen(Image &img) {
+    const double kernel[9] = { 0, -1,  0,
+                              -1,  5, -1,
+                               0, -1,  0};
+    applyKernel(img, kernel, 1.0);
+}
+
+// ---------------------------------------------------------------
+// Color Adjustment
+// ---------------------------------------------------------------
+// amount: -100 (darker) to +100 (brighter)
+void adjustBrightness(Image &img, int amount) {
+    double shift = amount * 2.55;
+    for (size_t i = 0; i < img.pixels.size(); i++) {
+        img.pixels[i] = clampByte(img.pixels[i] + shift);
+    }
+}
+
+// amount: -100 (less contrast) to +100 (more contrast)
+void adjustContrast(Image &img, int amount) {
+    double c = amount * 2.55;
+    double factor = (259.0 * (c + 255.0)) / (255.0 * (259.0 - c));
+    for (size_t i = 0; i < img.pixels.size(); i++) {
+        img.pixels[i] = clampByte(factor * (img.pixels[i] - 128.0) + 128.0);
+    }
+}
+
+// ---------------------------------------------------------------
+// Crop and Resize
+// ---------------------------------------------------------------
+Image cropImage(const Image &img, int startX, int startY, int newWidth, int newHeight) {
+    Image result;
+    result.create(newWidth, newHeight);
+    for (int y = 0; y < newHeight; y++) {
+        for (int x = 0; x < newWidth; x++) {
+            for (int c = 0; c < 3; c++) {
+                result.at(x, y, c) = img.at(startX + x, startY + y, c);
+            }
+        }
+    }
+    return result;
+}
+
+// Resizes using bilinear interpolation for smooth results
+Image resizeImage(const Image &img, int newWidth, int newHeight) {
+    Image result;
+    result.create(newWidth, newHeight);
+    double xRatio = static_cast<double>(img.width) / newWidth;
+    double yRatio = static_cast<double>(img.height) / newHeight;
+
+    for (int y = 0; y < newHeight; y++) {
+        double sy = max(0.0, (y + 0.5) * yRatio - 0.5);
+        int y0 = min(static_cast<int>(sy), img.height - 1);
+        int y1 = min(y0 + 1, img.height - 1);
+        double fy = sy - y0;
+
+        for (int x = 0; x < newWidth; x++) {
+            double sx = max(0.0, (x + 0.5) * xRatio - 0.5);
+            int x0 = min(static_cast<int>(sx), img.width - 1);
+            int x1 = min(x0 + 1, img.width - 1);
+            double fx = sx - x0;
+
+            for (int c = 0; c < 3; c++) {
+                double top = img.at(x0, y0, c) * (1 - fx) + img.at(x1, y0, c) * fx;
+                double bottom = img.at(x0, y1, c) * (1 - fx) + img.at(x1, y1, c) * fx;
+                result.at(x, y, c) = clampByte(top * (1 - fy) + bottom * fy);
+            }
+        }
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------
+// Sample image (so the tool can be tried without any file)
+// ---------------------------------------------------------------
+Image createSampleImage() {
+    Image img;
+    img.create(320, 200);
+    for (int y = 0; y < img.height; y++) {
+        for (int x = 0; x < img.width; x++) {
+            // Colourful gradient background
+            img.at(x, y, 0) = static_cast<unsigned char>(x * 255 / (img.width - 1));
+            img.at(x, y, 1) = static_cast<unsigned char>(y * 255 / (img.height - 1));
+            img.at(x, y, 2) = 120;
+
+            // White circle
+            double dx = x - 100, dy = y - 100;
+            if (dx * dx + dy * dy < 60 * 60) {
+                img.at(x, y, 0) = img.at(x, y, 1) = img.at(x, y, 2) = 255;
+            }
+            // Dark rectangle
+            if (x >= 190 && x < 290 && y >= 60 && y < 140) {
+                img.at(x, y, 0) = img.at(x, y, 1) = img.at(x, y, 2) = 30;
+            }
+        }
+    }
+    return img;
+}
+
+// ---------------------------------------------------------------
+// User interface
+// ---------------------------------------------------------------
+struct Editor {
+    Image image;
+    vector<Image> history;   // previous versions (for undo)
+    bool loaded = false;
+    bool modified = false;
+
+    bool requireImage() const {
+        if (!loaded) {
+            cout << "No image loaded! Please load an image first (option 1) or create a sample (option 9).\n";
+            return false;
+        }
+        return true;
+    }
+
+    // Remember the current image so the change can be undone
+    void saveState() {
+        history.push_back(image);
+        if (history.size() > MAX_HISTORY) {
+            history.erase(history.begin());
+        }
+        modified = true;
+    }
+
+    void showResult(const string &message) {
+        cout << message << "\n";
+        displayImage(image);
+    }
+};
+
+void displayMenu(const Editor &ed) {
+    cout << "\n=====================================\n";
+    cout << "        IMAGE PROCESSING TOOL        \n";
+    cout << "=====================================\n";
+    if (ed.loaded) {
+        cout << "Current image: " << ed.image.width << " x " << ed.image.height
+             << (ed.modified ? "  (unsaved changes)" : "") << "\n";
+    } else {
+        cout << "Current image: none\n";
+    }
+    cout << "-------------------------------------\n";
+    cout << "1. Load image (BMP)\n";
+    cout << "2. Display image\n";
+    cout << "3. Apply filter (grayscale, blur, sharpen)\n";
+    cout << "4. Adjust colors (brightness, contrast)\n";
+    cout << "5. Crop image\n";
+    cout << "6. Resize image\n";
+    cout << "7. Undo last change\n";
+    cout << "8. Save image\n";
+    cout << "9. Create sample image\n";
+    cout << "0. Exit\n";
+}
+
+void loadOption(Editor &ed) {
+    string filename = readLine("Enter the BMP file name (e.g. photo.bmp): ");
+    Image img;
+    string error;
+    if (loadBMP(filename, img, error)) {
+        ed.image = img;
+        ed.history.clear();
+        ed.loaded = true;
+        ed.modified = false;
+        ed.showResult("Image loaded successfully!");
+    } else {
+        cout << "Error: " << error << "\n";
+    }
+}
+
+void filterOption(Editor &ed) {
+    if (!ed.requireImage()) return;
+
+    cout << "\n--- Filters ---\n1. Grayscale\n2. Blur\n3. Sharpen\n0. Back\n";
+    int choice = readIntInRange("Choose a filter: ", 0, 3);
+    if (choice == 0) return;
+
+    if (choice == 1) {
+        ed.saveState();
+        applyGrayscale(ed.image);
+        ed.showResult("Grayscale filter applied.");
+    } else if (choice == 2) {
+        int strength = readIntInRange("Blur strength (1-10): ", 1, 10);
+        ed.saveState();
+        applyBlur(ed.image, strength);
+        ed.showResult("Blur filter applied.");
+    } else {
+        ed.saveState();
+        applySharpen(ed.image);
+        ed.showResult("Sharpen filter applied.");
+    }
+}
+
+void colorOption(Editor &ed) {
+    if (!ed.requireImage()) return;
+
+    cout << "\n--- Color Adjustment ---\n1. Brightness\n2. Contrast\n0. Back\n";
+    int choice = readIntInRange("Choose an option: ", 0, 2);
+    if (choice == 0) return;
+
+    if (choice == 1) {
+        int amount = readIntInRange("Brightness change (-100 to 100): ", -100, 100);
+        ed.saveState();
+        adjustBrightness(ed.image, amount);
+        ed.showResult("Brightness adjusted.");
+    } else {
+        int amount = readIntInRange("Contrast change (-100 to 100): ", -100, 100);
+        ed.saveState();
+        adjustContrast(ed.image, amount);
+        ed.showResult("Contrast adjusted.");
+    }
+}
+
+void cropOption(Editor &ed) {
+    if (!ed.requireImage()) return;
+
+    cout << "Image size is " << ed.image.width << " x " << ed.image.height
+         << ". Pixel (0,0) is the top-left corner.\n";
+    int x = readIntInRange("Start X (left): ", 0, ed.image.width - 1);
+    int y = readIntInRange("Start Y (top): ", 0, ed.image.height - 1);
+    int w = readIntInRange("Crop width: ", 1, ed.image.width - x);
+    int h = readIntInRange("Crop height: ", 1, ed.image.height - y);
+
+    ed.saveState();
+    ed.image = cropImage(ed.image, x, y, w, h);
+    ed.showResult("Image cropped.");
+}
+
+void resizeOption(Editor &ed) {
+    if (!ed.requireImage()) return;
+
+    cout << "Current size: " << ed.image.width << " x " << ed.image.height << "\n";
+    cout << "1. Enter new width and height\n2. Scale by percentage\n0. Back\n";
+    int choice = readIntInRange("Choose an option: ", 0, 2);
+    if (choice == 0) return;
+
+    int newWidth, newHeight;
+    if (choice == 1) {
+        newWidth = readIntInRange("New width: ", 1, MAX_DIMENSION);
+        newHeight = readIntInRange("New height: ", 1, MAX_DIMENSION);
+    } else {
+        int percent = readIntInRange("Scale percentage (1-500): ", 1, 500);
+        newWidth = max(1, ed.image.width * percent / 100);
+        newHeight = max(1, ed.image.height * percent / 100);
+        if (newWidth > MAX_DIMENSION || newHeight > MAX_DIMENSION) {
+            cout << "Result would be too large (max " << MAX_DIMENSION << " pixels).\n";
+            return;
+        }
+    }
+
+    ed.saveState();
+    ed.image = resizeImage(ed.image, newWidth, newHeight);
+    ed.showResult("Image resized.");
+}
+
+void undoOption(Editor &ed) {
+    if (!ed.requireImage()) return;
+    if (ed.history.empty()) {
+        cout << "Nothing to undo.\n";
+        return;
+    }
+    ed.image = ed.history.back();
+    ed.history.pop_back();
+    ed.showResult("Last change undone.");
+}
+
+void saveOption(Editor &ed) {
+    if (!ed.requireImage()) return;
+
+    string filename = readLine("Enter file name to save (e.g. result.bmp): ");
+    if (filename.size() < 4 || (filename.substr(filename.size() - 4) != ".bmp" &&
+                                filename.substr(filename.size() - 4) != ".BMP")) {
+        filename += ".bmp";
+    }
+    if (saveBMP(filename, ed.image)) {
+        cout << "Image saved as " << filename << "\n";
+        ed.modified = false;
+    } else {
+        cout << "Error: could not save the file. Check the name and permissions.\n";
+    }
+}
+
+int main() {
+    Editor editor;
+    int choice;
+
+    do {
+        displayMenu(editor);
+        choice = readIntInRange("Enter your choice (0-9): ", 0, 9);
+
+        switch (choice) {
+            case 1: loadOption(editor); break;
+            case 2:
+                if (editor.requireImage()) displayImage(editor.image);
+                break;
+            case 3: filterOption(editor); break;
+            case 4: colorOption(editor); break;
+            case 5: cropOption(editor); break;
+            case 6: resizeOption(editor); break;
+            case 7: undoOption(editor); break;
+            case 8: saveOption(editor); break;
+            case 9:
+                editor.image = createSampleImage();
+                editor.history.clear();
+                editor.loaded = true;
+                editor.modified = false;
+                editor.showResult("Sample image created.");
+                break;
+            case 0:
+                if (editor.modified && !askYesNo("You have unsaved changes. Exit anyway?")) {
+                    choice = -1;   // stay in the program
+                } else {
+                    cout << "\nThanks for using the Image Processing Tool. Goodbye!\n";
+                }
+                break;
+        }
+    } while (choice != 0);
+
+    return 0;
+}
